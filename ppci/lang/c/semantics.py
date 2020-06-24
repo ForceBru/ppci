@@ -37,8 +37,18 @@ class CSemantics:
 
         # Define the type for a string:
         self.int_type = self.get_type(["int"])
+        self.long_type = self.get_type(["long"])
         self.char_type = self.get_type(["char"])
         self.intptr_type = self.int_type.pointer_to()
+
+        # Choose proper integer type for difference:
+        if self.context.sizeof(self.int_type) == self.context.sizeof(
+            self.intptr_type
+        ):
+            self.size_t_type = self.int_type
+        else:
+            # TODO: this might be 4 bytes on LP64 mode:
+            self.size_t_type = self.long_type
 
         # Working variables:
         self.compounds = []
@@ -317,20 +327,26 @@ class CSemantics:
 
     def check_redeclaration_storage_class(self, sym, declaration):
         """ Test if we specified an invalid combo of storage class. """
-        old_storage_class = sym.declaration.storage_class
+        prev_storage_class = sym.declaration.storage_class
         new_storage_class = declaration.storage_class
         # None == automatic storage class.
-        invalid_combos = [(None, "static"), ("extern", "static")]
-        combo = (old_storage_class, new_storage_class)
-        if combo in invalid_combos:
+        was_static = prev_storage_class == "static"
+        is_static = new_storage_class == "static"
+
+        # Prevent change of static-ness after first declaration
+        if is_static and not was_static:
             message = "Invalid redefine of storage class. Was {}, but now {}".format(
-                old_storage_class, new_storage_class
+                prev_storage_class, new_storage_class
             )
             self.invalid_redeclaration(sym, declaration, message)
 
-        if not declaration.storage_class:
-            if sym.declaration.storage_class:
-                declaration.storage_class = sym.declaration.storage_class
+        # update current declarations storage class
+        if (
+            not declaration.storage_class
+            and prev_storage_class
+            and prev_storage_class != "extern"
+        ):
+            declaration.storage_class = sym.declaration.storage_class
 
     def invalid_redeclaration(
         self, sym, declaration, message="Invalid redefinition"
@@ -370,7 +386,7 @@ class CSemantics:
         struct { int f; };
         """
         # Layout the struct here!
-        assert tag or fields
+        assert tag or fields is not None
 
         mp = {"struct": types.StructType, "union": types.UnionType}
         klass = mp[kind]
@@ -382,7 +398,7 @@ class CSemantics:
             else:
                 ctyp = klass()
 
-            if fields:
+            if fields is not None:
                 ctyp.fields = fields
         else:
             assert tag
@@ -653,15 +669,15 @@ class CSemantics:
                 long_type = self.get_type(["long"])
                 uint_type = self.get_type(["unsigned", "int"])
 
-                if value < self.context.limit_max(self.int_type):
+                if value <= self.context.limit_max(self.int_type):
                     typ = self.int_type
-                elif value < self.context.limit_max(uint_type):
+                elif value <= self.context.limit_max(uint_type):
                     typ = uint_type
-                elif value < self.context.limit_max(long_type):
+                elif value <= self.context.limit_max(long_type):
                     typ = long_type
-                elif value < self.context.limit_max(ulong_type):
+                elif value <= self.context.limit_max(ulong_type):
                     typ = ulong_type
-                elif value < self.context.limit_max(longlong_type):
+                elif value <= self.context.limit_max(longlong_type):
                     typ = longlong_type
                 else:
                     typ = ulonglong_type
@@ -730,26 +746,75 @@ class CSemantics:
             result_typ = lhs.typ
             if not lhs.lvalue:
                 self.error("Expected lvalue", lhs.location)
+
+            if op[0] in ["+", "-"] and lhs.typ.is_pointer:
+                self.ensure_integer(rhs)
+                lhs = self.ensure_no_void_ptr(lhs)
             rhs = self.coerce(rhs, result_typ)
         elif op == ",":
             result_typ = rhs.typ
         elif op == "+":
             # Handle pointer arithmatic
-            if isinstance(lhs.typ, types.IndexableType):
-                rhs = self.coerce(rhs, self.int_type)
+            if lhs.typ.is_pointer:
+                # pointer + integer
+                self.ensure_integer(rhs)
+                lhs = self.ensure_no_void_ptr(lhs)
                 result_typ = lhs.typ
-            elif isinstance(rhs.typ, types.IndexableType):
-                lhs = self.coerce(lhs, self.int_type)
+            elif rhs.typ.is_pointer:
+                # integer + pointer
+                self.ensure_integer(lhs)
+                rhs = self.ensure_no_void_ptr(rhs)
                 result_typ = rhs.typ
+
+                # Swap left and right to ease code generation:
+                rhs, lhs = lhs, rhs
             else:
+                # numeric + numeric
+                lhs = self.promote(lhs)
+                rhs = self.promote(rhs)
+
                 result_typ = self.get_common_type(lhs.typ, rhs.typ, location)
                 lhs = self.coerce(lhs, result_typ)
                 rhs = self.coerce(rhs, result_typ)
         elif op == "-":
-            # TODO: Handle pointer arithmatic
-            result_typ = self.get_common_type(lhs.typ, rhs.typ, location)
-            lhs = self.coerce(lhs, result_typ)
-            rhs = self.coerce(rhs, result_typ)
+            # Handle pointer arithmatic:
+            if lhs.typ.is_pointer:
+                if rhs.typ.is_pointer:
+                    # pointer - pointer
+                    # operands must of compatible types and should
+                    # not be void *
+                    # result is a signed integer arge enough to contain
+                    # pointer difference
+
+                    # Ensure compatible pointer types:
+                    lhs = self.ensure_no_void_ptr(lhs)
+                    rhs = self.ensure_no_void_ptr(rhs)
+                    if not self.equal_types(
+                        lhs.typ.element_type, rhs.typ.element_type
+                    ):
+                        self.error(
+                            "Operands must point to compatible types,"
+                            " got {} and {}".format(
+                                type_to_str(lhs.typ), type_to_str(rhs.typ)
+                            ),
+                            location,
+                        )
+
+                    result_typ = self.size_t_type
+
+                else:
+                    # pointer - integer
+                    self.ensure_integer(rhs)
+                    lhs = self.ensure_no_void_ptr(lhs)
+                    result_typ = lhs.typ
+            else:
+                # numeric - numeric
+                lhs = self.promote(lhs)
+                rhs = self.promote(rhs)
+
+                result_typ = self.get_common_type(lhs.typ, rhs.typ, location)
+                lhs = self.coerce(lhs, result_typ)
+                rhs = self.coerce(rhs, result_typ)
         elif op in ["<", ">", "==", "!=", "<=", ">="]:
             if not (lhs.typ.is_scalar or lhs.typ.is_pointer):
                 self.error("Expected scalar or pointer", lhs.location)
@@ -764,11 +829,11 @@ class CSemantics:
             # Booleans are integer type:
             result_typ = self.int_type
         elif op in ["<<", ">>", "|", "&", "^"]:  # Bit shifting operators
-            if not lhs.typ.is_integer:
-                self.error("Expected integer", lhs.location)
+            self.ensure_integer(lhs)
+            self.ensure_integer(rhs)
 
-            if not rhs.typ.is_integer:
-                self.error("Expected integer", rhs.location)
+            lhs = self.promote(lhs)
+            rhs = self.promote(rhs)
 
             result_typ = self.get_common_type(lhs.typ, rhs.typ, location)
             lhs = self.coerce(lhs, result_typ)
@@ -779,6 +844,9 @@ class CSemantics:
 
             if not rhs.typ.is_scalar:
                 self.error("Expected scalar", rhs.location)
+
+            lhs = self.promote(lhs)
+            rhs = self.promote(rhs)
 
             result_typ = self.get_common_type(lhs.typ, rhs.typ, location)
             lhs = self.coerce(lhs, result_typ)
@@ -806,20 +874,18 @@ class CSemantics:
             expr = expressions.UnaryOperator(op, a, a.typ, False, location)
         elif op == "~":
             a = self.pointer(a)
-
-            if not a.typ.is_integer:
-                self.error("Expected integer", a.location)
-
+            self.ensure_integer(a)
             expr = expressions.UnaryOperator(op, a, a.typ, False, location)
         elif op == "+":
             expr = self.pointer(a)
         elif op == "*":
             a = self.pointer(a)
-            if not isinstance(a.typ, types.IndexableType):
+            if not a.typ.is_pointer:
                 self.error(
                     "Cannot dereference type {}".format(type_to_str(a.typ)),
                     a.location,
                 )
+            a = self.ensure_no_void_ptr(a)
             typ = a.typ.element_type
             expr = expressions.UnaryOperator(op, a, typ, True, location)
         elif op == "&":
@@ -849,7 +915,7 @@ class CSemantics:
 
     def on_sizeof(self, typ, location):
         """ Handle sizeof contraption """
-        expr = expressions.Sizeof(typ, self.int_type, False, location)
+        expr = expressions.Sizeof(typ, self.size_t_type, False, location)
         return expr
 
     def on_cast(self, to_typ, casted_expr, location):
@@ -1073,9 +1139,15 @@ class CSemantics:
         """
         assert isinstance(typ, types.CType)
         assert isinstance(expr, expressions.CExpression)
+
         do_cast = False
         from_type = expr.typ
         to_type = typ
+
+        if from_type.is_void:
+            self.error(
+                "Value expected but got 'void'", expr.location,
+            )
 
         if self.equal_types(from_type, to_type):
             pass
@@ -1143,6 +1215,32 @@ class CSemantics:
     def get_type(self, type_specifiers):
         """ Retrieve a type by type specifiers """
         return self._root_scope.get_type(type_specifiers)
+
+    def ensure_integer(self, expr: expressions.CExpression):
+        """ Ensure typ is of any integer type. """
+        if not expr.typ.is_integer_or_enum:
+            self.error(
+                "integer or enum type expected but got {}".format(
+                    type_to_str(expr.typ)
+                ),
+                expr.location,
+            )
+
+    def ensure_no_void_ptr(self, expr):
+        """ Test if expr has type void*, and if so, generate
+        a warning and an implicit cast statement.
+        """
+        assert expr.typ.is_pointer
+        if expr.typ.element_type.is_void:
+            self.warning(
+                "'void *' cannot be used, assuming 'char*'", expr.location
+            )
+            char_ptr = self.char_type.pointer_to()
+            return expressions.ImplicitCast(
+                expr, char_ptr, False, expr.location
+            )
+        else:
+            return expr
 
     def get_common_type(self, typ1, typ2, location):
         """ Given two types, determine the common type.

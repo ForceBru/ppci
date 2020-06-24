@@ -4,8 +4,18 @@
 
 
 def is_scalar(typ):
-    """ Determine whether the given type is of scalar kind """
-    return isinstance(typ, BasicType) and not is_void(typ)
+    """ Determine whether the given type is of scalar kind.
+
+    This includes:
+    - integers
+    - floats
+    - enumerations
+    """
+    return (isinstance(typ, BasicType) and not is_void(typ)) or is_enum(typ)
+
+
+def is_enum(typ) -> bool:
+    return isinstance(typ, EnumType)
 
 
 def is_char_array(typ):
@@ -92,6 +102,10 @@ class CType:
         return isinstance(self, PointerType)
 
     @property
+    def is_function(self) -> bool:
+        return isinstance(self, FunctionType)
+
+    @property
     def is_float(self):
         """ See if this type is float """
         return is_float(self)
@@ -120,6 +134,10 @@ class CType:
     def is_integer(self):
         """ Check if this type is an integer type """
         return is_integer(self)
+
+    @property
+    def is_integer_or_enum(self):
+        return is_integer(self) or is_enum(self)
 
     @property
     def is_promotable(self):

@@ -244,6 +244,7 @@ class CFrontendTestCase(unittest.TestCase):
         """ Test structure usage """
         src = """
         typedef struct {int quot, rem; } div_t;
+        struct {} empty_unit;
         struct z { int foo; };
         struct s;
         struct s* p;
@@ -392,6 +393,22 @@ class CFrontendTestCase(unittest.TestCase):
         void main() {
          int* a, b;
          b = a[100];
+        }
+        """
+        self.do(src)
+
+    def test_pointer_arithmatics(self):
+        """ Test dark pointer voodoo """
+        src = """
+        void main() {
+         int *a, b, *c;
+         a = &b;
+         c = a + 10;  // pointer + numeric
+         c = 20 + a;  // numeric + pointer
+         a = a - 10;  // pointer - numeric
+         b = c - a;   // pointer - pointer
+         a += 2;
+         a -= 4;
         }
         """
         self.do(src)
@@ -619,8 +636,12 @@ class CFrontendTestCase(unittest.TestCase):
     def test_function_argument_name(self):
         """ Test an argument name with the same name as a typedef """
         src = """
-        typedef int a;
+        typedef double a;
         void add(a a) {
+          a: return;
+        }
+        void mul(int a) {
+          unsigned int a;
         }
         """
         self.do(src)
